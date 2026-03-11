@@ -19,7 +19,7 @@ from spiremind.domain.models import (
     normalize_name,
 )
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 
 @dataclass(slots=True)
@@ -32,6 +32,7 @@ class CatalogCard:
     card_type: CardType
     tags: list[str]
     effect_text: str
+    image_url: str
     status: str
     confidence_catalog: str
     source: str
@@ -46,6 +47,7 @@ class CatalogEvent:
     normalized_name: str
     options: list[str]
     impact_tags: list[str]
+    image_url: str
     status: str
     confidence_catalog: str
     source: str
@@ -115,6 +117,7 @@ class CatalogStore:
                     card_type TEXT NOT NULL,
                     tags_json TEXT NOT NULL,
                     effect_text TEXT NOT NULL,
+                    image_url TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     confidence_catalog TEXT NOT NULL,
                     source TEXT NOT NULL,
@@ -139,6 +142,7 @@ class CatalogStore:
                     normalized_name TEXT NOT NULL,
                     options_json TEXT NOT NULL,
                     impact_tags_json TEXT NOT NULL,
+                    image_url TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     confidence_catalog TEXT NOT NULL,
                     source TEXT NOT NULL,
@@ -259,6 +263,12 @@ class CatalogStore:
             "discovery_log", "game_id", "TEXT NOT NULL DEFAULT 'STS2'"
         )
         self._ensure_column_exists("metrics_log", "run_id", "TEXT")
+        self._ensure_column_exists(
+            "cards_catalog", "image_url", "TEXT NOT NULL DEFAULT ''"
+        )
+        self._ensure_column_exists(
+            "events_catalog", "image_url", "TEXT NOT NULL DEFAULT ''"
+        )
 
     def _ensure_column_exists(
         self, table_name: str, column_name: str, column_def: str
@@ -813,8 +823,8 @@ class CatalogStore:
                     """
                     INSERT OR IGNORE INTO cards_catalog
                         (game_id, name, normalized_name, energy_cost, card_type, tags_json,
-                         effect_text, status, confidence_catalog, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         effect_text, image_url, status, confidence_catalog, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         GameId.STS2.value,
@@ -824,6 +834,7 @@ class CatalogStore:
                         card["card_type"],
                         json.dumps(card["tags"]),
                         card["effect_text"],
+                        "",
                         "known",
                         "MEDIUM",
                         "micro_seed",
@@ -854,8 +865,8 @@ class CatalogStore:
                     """
                     INSERT OR IGNORE INTO events_catalog
                         (game_id, name, normalized_name, options_json, impact_tags_json,
-                         status, confidence_catalog, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         image_url, status, confidence_catalog, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         GameId.STS2.value,
@@ -863,6 +874,7 @@ class CatalogStore:
                         normalize_name(event["name"]),
                         json.dumps(event["options"]),
                         json.dumps(event["impact_tags"]),
+                        "",
                         "known",
                         "MEDIUM",
                         "micro_seed",
@@ -891,6 +903,7 @@ class CatalogStore:
             else CardType.UNKNOWN,
             tags=json.loads(row["tags_json"]),
             effect_text=row["effect_text"],
+            image_url=row["image_url"],
             status=row["status"],
             confidence_catalog=row["confidence_catalog"],
             source=row["source"],
@@ -913,8 +926,8 @@ class CatalogStore:
                 """
                 INSERT INTO cards_catalog
                     (game_id, name, normalized_name, energy_cost, card_type, tags_json,
-                     effect_text, status, confidence_catalog, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     effect_text, image_url, status, confidence_catalog, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     GameId.STS2.value,
@@ -924,6 +937,7 @@ class CatalogStore:
                     card_input.card_type.value,
                     json.dumps([]),
                     card_input.effect_text,
+                    card_input.image_url,
                     "discovered",
                     "LOW",
                     "user_discovery",
@@ -942,6 +956,7 @@ class CatalogStore:
             card_type=card_input.card_type,
             tags=[],
             effect_text=card_input.effect_text,
+            image_url=card_input.image_url,
             status="discovered",
             confidence_catalog="LOW",
             source="user_discovery",
@@ -966,6 +981,7 @@ class CatalogStore:
             normalized_name=row["normalized_name"],
             options=json.loads(row["options_json"]),
             impact_tags=json.loads(row["impact_tags_json"]),
+            image_url=row["image_url"],
             status=row["status"],
             confidence_catalog=row["confidence_catalog"],
             source=row["source"],
@@ -978,6 +994,7 @@ class CatalogStore:
         options: list[str],
         run_id: str,
         floor: int,
+        image_url: str = "",
     ) -> CatalogEvent:
         normalized = normalize_name(event_name)
         existing = self.get_event_by_normalized_name(normalized)
@@ -990,8 +1007,8 @@ class CatalogStore:
                 """
                 INSERT INTO events_catalog
                     (game_id, name, normalized_name, options_json, impact_tags_json,
-                     status, confidence_catalog, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     image_url, status, confidence_catalog, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     GameId.STS2.value,
@@ -999,6 +1016,7 @@ class CatalogStore:
                     normalized,
                     json.dumps(options),
                     json.dumps([]),
+                    image_url,
                     "discovered",
                     "LOW",
                     "user_discovery",
@@ -1015,6 +1033,7 @@ class CatalogStore:
             normalized_name=normalized,
             options=options,
             impact_tags=[],
+            image_url=image_url,
             status="discovered",
             confidence_catalog="LOW",
             source="user_discovery",
@@ -1048,6 +1067,7 @@ class CatalogStore:
                 else CardType.UNKNOWN,
                 tags=json.loads(row["tags_json"]),
                 effect_text=row["effect_text"],
+                image_url=row["image_url"],
                 status=row["status"],
                 confidence_catalog=row["confidence_catalog"],
                 source=row["source"],
@@ -1079,6 +1099,7 @@ class CatalogStore:
                 normalized_name=row["normalized_name"],
                 options=json.loads(row["options_json"]),
                 impact_tags=json.loads(row["impact_tags_json"]),
+                image_url=row["image_url"],
                 status=row["status"],
                 confidence_catalog=row["confidence_catalog"],
                 source=row["source"],
@@ -1087,7 +1108,13 @@ class CatalogStore:
             for row in rows
         ]
 
-    def review_card(self, card_id: int, tags: list[str], effect_text: str) -> None:
+    def review_card(
+        self,
+        card_id: int,
+        tags: list[str],
+        effect_text: str,
+        image_url: str = "",
+    ) -> None:
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT game_id, normalized_name FROM cards_catalog WHERE id = ?",
@@ -1098,11 +1125,11 @@ class CatalogStore:
             conn.execute(
                 """
                 UPDATE cards_catalog
-                SET tags_json = ?, effect_text = ?, status = 'reviewed',
+                SET tags_json = ?, effect_text = ?, image_url = ?, status = 'reviewed',
                     confidence_catalog = 'MEDIUM', updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (json.dumps(tags), effect_text, card_id),
+                (json.dumps(tags), effect_text, image_url, card_id),
             )
             conn.execute(
                 """
@@ -1113,7 +1140,12 @@ class CatalogStore:
                 (row["game_id"], row["normalized_name"]),
             )
 
-    def review_event(self, event_id: int, impact_tags: list[str]) -> None:
+    def review_event(
+        self,
+        event_id: int,
+        impact_tags: list[str],
+        image_url: str = "",
+    ) -> None:
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT game_id, normalized_name FROM events_catalog WHERE id = ?",
@@ -1124,11 +1156,11 @@ class CatalogStore:
             conn.execute(
                 """
                 UPDATE events_catalog
-                SET impact_tags_json = ?, status = 'reviewed',
+                SET impact_tags_json = ?, image_url = ?, status = 'reviewed',
                     confidence_catalog = 'MEDIUM', updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (json.dumps(impact_tags), event_id),
+                (json.dumps(impact_tags), image_url, event_id),
             )
             conn.execute(
                 """
@@ -1138,6 +1170,45 @@ class CatalogStore:
                 """,
                 (row["game_id"], row["normalized_name"]),
             )
+
+    def cleanup_orphaned_uploaded_images(
+        self,
+        upload_dir: str | Path = "assets/uploads",
+    ) -> dict[str, int]:
+        upload_path = Path(upload_dir)
+        if not upload_path.exists():
+            return {"removed": 0, "kept": 0}
+
+        with self.connect() as conn:
+            card_rows = conn.execute(
+                "SELECT image_url FROM cards_catalog WHERE image_url <> ''"
+            ).fetchall()
+            event_rows = conn.execute(
+                "SELECT image_url FROM events_catalog WHERE image_url <> ''"
+            ).fetchall()
+
+        referenced_names = {
+            Path(str(row["image_url"])).name
+            for row in [*card_rows, *event_rows]
+            if row["image_url"]
+        }
+
+        image_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+        removed = 0
+        kept = 0
+        for file_path in upload_path.iterdir():
+            if (
+                not file_path.is_file()
+                or file_path.suffix.lower() not in image_suffixes
+            ):
+                continue
+            if file_path.name in referenced_names:
+                kept += 1
+                continue
+            file_path.unlink(missing_ok=True)
+            removed += 1
+
+        return {"removed": removed, "kept": kept}
 
     def _increment_discovery(
         self,

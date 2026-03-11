@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 import streamlit as st
 
@@ -15,6 +16,52 @@ from spiremind.domain.models import (
 from spiremind.engine.card_picker import CardPickerEngine
 from spiremind.engine.event_advisor import EventAdvisorEngine
 from spiremind.engine.path_planner import PathCandidate, PathPlannerEngine
+from spiremind.ui.image_assets import (
+    list_recent_uploaded_assets,
+    resolve_image_source,
+    validate_uploaded_image,
+)
+
+
+def _inject_base_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .sm-card {
+            border: 1px solid #dbe3ea;
+            border-radius: 14px;
+            padding: 14px;
+            background: linear-gradient(180deg, #ffffff 0%, #f7fafc 100%);
+            box-shadow: 0 6px 18px rgba(26, 43, 60, 0.08);
+            margin-bottom: 12px;
+        }
+        .sm-title {
+            margin: 0;
+            font-size: 1.05rem;
+            font-weight: 700;
+            color: #1b3348;
+        }
+        .sm-meta {
+            margin: 6px 0 0 0;
+            color: #44586a;
+            font-size: 0.9rem;
+        }
+        .sm-badge {
+            display: inline-block;
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            padding: 4px 8px;
+            border-radius: 999px;
+            margin-right: 6px;
+            margin-top: 4px;
+            color: #133248;
+            background: #dceff9;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _ensure_active_run(catalog) -> str:
@@ -59,21 +106,180 @@ def _build_run_state(active_run_id: str) -> RunState:
     )
 
 
-def _card_input(prefix: str) -> CardOptionInput:
-    name = st.text_input(f"{prefix} - Name", value="")
-    energy_cost = st.number_input(f"{prefix} - Cost", min_value=0, max_value=5, value=1)
+def _show_image_preview(url: str, caption: str) -> None:
+    cleaned = url.strip()
+    if not cleaned:
+        st.caption("No image URL yet")
+        return
+    try:
+        st.image(cleaned, caption=caption, use_container_width=True)
+    except Exception:
+        st.caption("Image preview unavailable. Check URL.")
+
+
+def _resolve_image_source(
+    image_url: str,
+    uploaded_file: Any | None,
+    scope: str,
+    entity_name: str,
+) -> str:
+    try:
+        return resolve_image_source(image_url, uploaded_file, scope, entity_name)
+    except ValueError as error:
+        st.warning(str(error))
+        return image_url.strip()
+
+
+def _image_uploader(label: str, key: str) -> Any | None:
+    uploaded_file = st.file_uploader(
+        label,
+        type=["png", "jpg", "jpeg", "webp", "gif"],
+        key=key,
+    )
+    if uploaded_file is None:
+        return None
+    validation_error = validate_uploaded_image(uploaded_file)
+    if validation_error:
+        st.warning(validation_error)
+        return None
+    return uploaded_file
+
+
+def _card_with_resolved_image(
+    card_input: CardOptionInput,
+    uploaded_file: Any | None,
+    scope: str,
+) -> CardOptionInput:
+    return CardOptionInput(
+        name=card_input.name,
+        energy_cost=card_input.energy_cost,
+        card_type=card_input.card_type,
+        effect_text=card_input.effect_text,
+        image_url=_resolve_image_source(
+            card_input.image_url,
+            uploaded_file,
+            scope,
+            card_input.name,
+        ),
+    )
+
+
+def _card_input(prefix: str, key_prefix: str) -> tuple[CardOptionInput, Any | None]:
+    st.markdown(
+        f"<div class='sm-card'><p class='sm-title'>{prefix}</p><p class='sm-meta'>Card details and artwork URL</p></div>",
+        unsafe_allow_html=True,
+    )
+    name = st.text_input("Name", value="", key=f"{key_prefix}_name")
+    energy_cost = st.number_input(
+        "Cost", min_value=0, max_value=5, value=1, key=f"{key_prefix}_cost"
+    )
     card_type_raw = st.selectbox(
-        f"{prefix} - Type",
+        "Type",
         [card_type.value for card_type in CardType],
         index=0,
+        key=f"{key_prefix}_type",
     )
-    effect_text = st.text_input(f"{prefix} - Effect text (optional)", value="")
-    return CardOptionInput(
-        name=name or "Unknown Card",
-        energy_cost=int(energy_cost),
-        card_type=CardType(card_type_raw),
-        effect_text=effect_text,
+    effect_text = st.text_input(
+        "Effect text (optional)", value="", key=f"{key_prefix}_effect"
     )
+    image_url = st.text_input(
+        "Image URL (optional)",
+        value="",
+        placeholder="https://...",
+        key=f"{key_prefix}_image_url",
+    )
+    uploaded_image = _image_uploader(
+        "Fallback upload (optional)",
+        key=f"{key_prefix}_image_upload",
+    )
+    if uploaded_image is not None:
+        st.image(
+            uploaded_image, caption=f"{prefix} upload preview", use_container_width=True
+        )
+    else:
+        _show_image_preview(image_url, caption=f"{prefix} preview")
+    return (
+        CardOptionInput(
+            name=name or "Unknown Card",
+            energy_cost=int(energy_cost),
+            card_type=CardType(card_type_raw),
+            effect_text=effect_text,
+            image_url=image_url.strip(),
+        ),
+        uploaded_image,
+    )
+
+
+def _render_card_results(result, latency_ms: float) -> None:
+    st.success(
+        f"Top choice: {result.top_choice.name} ({result.top_choice.score_total})"
+    )
+    st.markdown(
+        f"""
+        <div class='sm-card'>
+            <p class='sm-title'>Recommendation Summary</p>
+            <p class='sm-meta'>Overall confidence: {result.overall_confidence.value} | Latency: {latency_ms} ms</p>
+            <p class='sm-meta'>{result.caution_note}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    for item in result.ranked_options:
+        badges = (
+            f"<span class='sm-badge'>score {item.score_total}</span>"
+            f"<span class='sm-badge'>{item.confidence.value}</span>"
+            f"<span class='sm-badge'>{item.risk_level.value}</span>"
+            f"<span class='sm-badge'>{item.entity_status}</span>"
+        )
+        st.markdown(
+            f"<div class='sm-card'><p class='sm-title'>{item.name}</p>{badges}</div>",
+            unsafe_allow_html=True,
+        )
+        for reason in item.reasons:
+            st.write(f"- {reason}")
+
+
+def _render_event_results(event_result, latency_ms: float) -> None:
+    st.success(f"Recommended: {event_result.recommended_option}")
+    st.markdown(
+        f"""
+        <div class='sm-card'>
+            <p class='sm-title'>{event_result.event_name}</p>
+            <span class='sm-badge'>{event_result.confidence.value}</span>
+            <span class='sm-badge'>{event_result.risk_level.value}</span>
+            <span class='sm-badge'>{event_result.entity_status}</span>
+            <p class='sm-meta'>Latency: {latency_ms} ms</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    for reason in event_result.reasons:
+        st.write(f"- {reason}")
+
+
+def _render_recent_asset_gallery() -> None:
+    st.markdown("### Recent uploaded images")
+    recent_assets = list_recent_uploaded_assets(limit=8)
+    if not recent_assets:
+        st.caption("No local uploads yet")
+        return
+    if st.button("Open upload folder path", key="open_upload_folder_path"):
+        st.code("assets/uploads")
+    columns = st.columns(4)
+    for idx, asset in enumerate(recent_assets):
+        col = columns[idx % 4]
+        with col:
+            st.image(asset, use_container_width=True)
+            st.caption(asset.split("/")[-1])
+
+
+def _render_asset_maintenance(catalog) -> None:
+    st.markdown("### Asset maintenance")
+    if st.button("Cleanup orphan uploads", key="cleanup_orphan_uploads"):
+        stats = catalog.cleanup_orphaned_uploaded_images("assets/uploads")
+        st.success(
+            f"Cleanup done. Removed: {stats['removed']} | Kept referenced: {stats['kept']}"
+        )
 
 
 def _run_controls(catalog) -> str | None:
@@ -151,6 +357,7 @@ def _decision_feedback_ui(catalog, key_prefix: str) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="SpireMind STS2", page_icon="S", layout="wide")
+    _inject_base_styles()
     st.title("SpireMind MVP - Slay the Spire 2")
     st.caption("Suggerimenti carta, path, eventi e discovery progressiva")
     st.info(
@@ -181,12 +388,17 @@ def main() -> None:
 
     with tabs[0]:
         st.subheader("Card options")
-        c1 = _card_input("Card 1")
-        c2 = _card_input("Card 2")
-        c3 = _card_input("Card 3")
+        input_col, result_col = st.columns([1.5, 1.2])
+        with input_col:
+            c1_input, c1_upload = _card_input("Card 1", "card_1")
+            c2_input, c2_upload = _card_input("Card 2", "card_2")
+            c3_input, c3_upload = _card_input("Card 3", "card_3")
         skip = CardOptionInput(name="Skip", energy_cost=0, card_type=CardType.SKILL)
 
-        if st.button("Recommend card"):
+        if input_col.button("Recommend card", type="primary"):
+            c1 = _card_with_resolved_image(c1_input, c1_upload, "card")
+            c2 = _card_with_resolved_image(c2_input, c2_upload, "card")
+            c3 = _card_with_resolved_image(c3_input, c3_upload, "card")
             started_at = catalog.measure_latency()
             result = card_engine.recommend(run_state, [c1, c2, c3, skip])
             latency_ms = catalog.elapsed_ms(started_at)
@@ -217,22 +429,21 @@ def main() -> None:
             st.session_state["card_decision_id"] = decision_id
             st.session_state["card_recommended"] = result.top_choice.name
 
-            st.success(
-                f"Top choice: {result.top_choice.name} ({result.top_choice.score_total})"
-            )
-            st.write(f"Overall confidence: {result.overall_confidence.value}")
-            st.write(f"Latency: {latency_ms} ms")
-            st.write(result.caution_note)
+            st.session_state["card_last_result"] = result
+            st.session_state["card_last_latency"] = latency_ms
+
+        with result_col:
+            card_last = st.session_state.get("card_last_result")
+            card_latency = st.session_state.get("card_last_latency")
+            if card_last and card_latency is not None:
+                _render_card_results(card_last, float(card_latency))
+
+        if st.session_state.get("card_last_result"):
+            result = st.session_state["card_last_result"]
             if result.overall_confidence.value == "LOW":
                 st.warning(
                     "Confidence LOW: valuta review di carte/eventi sconosciuti nella tab Knowledge Review."
                 )
-            for item in result.ranked_options:
-                st.markdown(
-                    f"- **{item.name}** | score {item.score_total} | confidence {item.confidence.value} | status {item.entity_status}"
-                )
-                for reason in item.reasons:
-                    st.write(f"  - {reason}")
 
         _decision_feedback_ui(catalog, "card")
 
@@ -313,15 +524,49 @@ def main() -> None:
 
     with tabs[2]:
         st.subheader("Event options")
-        event_name = st.text_input("Event name", value="Strange Device")
-        e1 = st.text_input("Option 1", value="Touch it")
-        e2 = st.text_input("Option 2", value="Leave")
-        e3 = st.text_input("Option 3 (optional)", value="")
-        options = [opt for opt in [e1, e2, e3] if opt.strip()]
+        input_col, result_col = st.columns([1.5, 1.2])
+        with input_col:
+            st.markdown(
+                "<div class='sm-card'><p class='sm-title'>Event details</p><p class='sm-meta'>Name, image and options</p></div>",
+                unsafe_allow_html=True,
+            )
+            event_name = st.text_input("Event name", value="Strange Device")
+            event_image_url = st.text_input(
+                "Event image URL (optional)",
+                value="",
+                placeholder="https://...",
+            )
+            event_image_upload = _image_uploader(
+                "Fallback upload (optional)",
+                key="event_image_upload",
+            )
+            if event_image_upload is not None:
+                st.image(
+                    event_image_upload,
+                    caption="Event upload preview",
+                    use_container_width=True,
+                )
+            else:
+                _show_image_preview(event_image_url, caption="Event preview")
+            e1 = st.text_input("Option 1", value="Touch it")
+            e2 = st.text_input("Option 2", value="Leave")
+            e3 = st.text_input("Option 3 (optional)", value="")
+            options = [opt for opt in [e1, e2, e3] if opt.strip()]
 
-        if st.button("Recommend event option"):
+        if input_col.button("Recommend event option", type="primary"):
+            resolved_event_image = _resolve_image_source(
+                event_image_url,
+                event_image_upload,
+                "event",
+                event_name,
+            )
             started_at = catalog.measure_latency()
-            event_result = event_engine.recommend(run_state, event_name, options)
+            event_result = event_engine.recommend(
+                run_state,
+                event_name,
+                options,
+                image_url=resolved_event_image,
+            )
             latency_ms = catalog.elapsed_ms(started_at)
             catalog.log_metric(
                 "event", event_result.confidence.value, latency_ms, run_id=active_run_id
@@ -348,19 +593,25 @@ def main() -> None:
             st.session_state["event_decision_id"] = decision_id
             st.session_state["event_recommended"] = event_result.recommended_option
 
-            st.success(f"Recommended: {event_result.recommended_option}")
-            st.write(f"Confidence: {event_result.confidence.value}")
-            st.write(f"Risk: {event_result.risk_level.value}")
-            st.write(f"Latency: {latency_ms} ms")
-            st.write(f"Status: {event_result.entity_status}")
+            st.session_state["event_last_result"] = event_result
+            st.session_state["event_last_latency"] = latency_ms
+
+        with result_col:
+            event_last = st.session_state.get("event_last_result")
+            event_latency = st.session_state.get("event_last_latency")
+            if event_last and event_latency is not None:
+                _render_event_results(event_last, float(event_latency))
+
+        if st.session_state.get("event_last_result"):
+            event_result = st.session_state["event_last_result"]
             if event_result.entity_status == "discovered":
                 st.warning(
                     "Evento non ancora reviewato: la raccomandazione privilegia opzioni conservative."
                 )
-            for reason in event_result.reasons:
-                st.write(f"- {reason}")
 
         _decision_feedback_ui(catalog, "event")
+        _render_recent_asset_gallery()
+        _render_asset_maintenance(catalog)
 
     with tabs[3]:
         st.subheader("Discovered entities")
@@ -394,9 +645,32 @@ def main() -> None:
                     value=card.effect_text,
                     key=f"card_effect_{card.id}",
                 )
+                image_url = st.text_input(
+                    "Image URL",
+                    value=card.image_url,
+                    key=f"card_image_{card.id}",
+                )
+                uploaded_image = _image_uploader(
+                    "Fallback upload",
+                    key=f"card_upload_{card.id}",
+                )
+                if uploaded_image is not None:
+                    st.image(
+                        uploaded_image,
+                        caption=f"{card.name} upload preview",
+                        use_container_width=True,
+                    )
+                else:
+                    _show_image_preview(image_url, caption=card.name)
                 if st.button("Mark card as reviewed", key=f"review_card_{card.id}"):
                     tags = [t.strip() for t in tags_text.split(",") if t.strip()]
-                    catalog.review_card(card.id, tags, effect_text)
+                    resolved_image = _resolve_image_source(
+                        image_url,
+                        uploaded_image,
+                        "review-card",
+                        card.name,
+                    )
+                    catalog.review_card(card.id, tags, effect_text, resolved_image)
                     st.success("Card reviewed")
 
         st.markdown("### Events")
@@ -420,9 +694,32 @@ def main() -> None:
                     value=", ".join(event.impact_tags),
                     key=f"event_tags_{event.id}",
                 )
+                image_url = st.text_input(
+                    "Image URL",
+                    value=event.image_url,
+                    key=f"event_image_{event.id}",
+                )
+                uploaded_image = _image_uploader(
+                    "Fallback upload",
+                    key=f"event_upload_{event.id}",
+                )
+                if uploaded_image is not None:
+                    st.image(
+                        uploaded_image,
+                        caption=f"{event.name} upload preview",
+                        use_container_width=True,
+                    )
+                else:
+                    _show_image_preview(image_url, caption=event.name)
                 if st.button("Mark event as reviewed", key=f"review_event_{event.id}"):
                     tags = [t.strip() for t in tags_text.split(",") if t.strip()]
-                    catalog.review_event(event.id, tags)
+                    resolved_image = _resolve_image_source(
+                        image_url,
+                        uploaded_image,
+                        "review-event",
+                        event.name,
+                    )
+                    catalog.review_event(event.id, tags, resolved_image)
                     st.success("Event reviewed")
 
     with tabs[4]:

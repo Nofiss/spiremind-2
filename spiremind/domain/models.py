@@ -78,6 +78,7 @@ class CardOptionInput:
     energy_cost: int
     card_type: CardType
     effect_text: str = ""
+    image_url: str = ""
 
     def normalized_name(self) -> str:
         return normalize_name(self.name)

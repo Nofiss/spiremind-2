@@ -25,10 +25,15 @@ class EventAdvisorEngine:
         run_state: RunState,
         event_name: str,
         options: list[str],
+        image_url: str = "",
     ) -> EventRecommendation:
         run_state.validate()
         record = self.catalog.discover_event(
-            event_name, options, run_state.run_id, run_state.floor
+            event_name,
+            options,
+            run_state.run_id,
+            run_state.floor,
+            image_url=image_url,
         )
         hp_ratio = run_state.current_hp / run_state.max_hp
 

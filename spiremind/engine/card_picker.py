@@ -90,6 +90,7 @@ class CardPickerEngine:
                     card_type=CardType.SKILL,
                     tags=["skip"],
                     effect_text="",
+                    image_url="",
                     status="known",
                     confidence_catalog="HIGH",
                     source="system",
