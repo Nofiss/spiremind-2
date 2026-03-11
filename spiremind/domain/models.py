@@ -24,6 +24,12 @@ class RiskLevel(str, Enum):
     HIGH = "HIGH"
 
 
+class RunStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    ABANDONED = "ABANDONED"
+    COMPLETED = "COMPLETED"
+
+
 class CardType(str, Enum):
     ATTACK = "ATTACK"
     SKILL = "SKILL"

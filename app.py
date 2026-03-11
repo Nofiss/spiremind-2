@@ -4,6 +4,7 @@ import uuid
 
 import streamlit as st
 
+from spiremind.bootstrap import bootstrap
 from spiremind.domain.models import (
     CardOptionInput,
     CardType,
@@ -11,16 +12,32 @@ from spiremind.domain.models import (
     GameId,
     RunState,
 )
-from spiremind.bootstrap import bootstrap
 from spiremind.engine.card_picker import CardPickerEngine
 from spiremind.engine.event_advisor import EventAdvisorEngine
 from spiremind.engine.path_planner import PathCandidate, PathPlannerEngine
 
 
-def _build_run_state() -> RunState:
+def _ensure_active_run(catalog) -> str:
+    active = catalog.get_active_run()
+    if active:
+        st.session_state.run_id = active.run_id
+        return active.run_id
+
     if "run_id" not in st.session_state:
         st.session_state.run_id = str(uuid.uuid4())
+    run_id = st.session_state.run_id
+    try:
+        catalog.create_run(run_id, Character.IRONCLAD)
+    except ValueError:
+        active = catalog.get_active_run()
+        if active:
+            st.session_state.run_id = active.run_id
+            return active.run_id
+        raise
+    return run_id
 
+
+def _build_run_state(active_run_id: str) -> RunState:
     current_hp = st.number_input("Current HP", min_value=1, max_value=200, value=70)
     max_hp = st.number_input("Max HP", min_value=1, max_value=200, value=80)
     act = st.number_input("Act", min_value=1, max_value=4, value=1)
@@ -29,7 +46,7 @@ def _build_run_state() -> RunState:
 
     return RunState(
         game_id=GameId.STS2,
-        run_id=st.session_state.run_id,
+        run_id=active_run_id,
         character=Character.IRONCLAD,
         ascension=0,
         act=int(act),
@@ -59,6 +76,79 @@ def _card_input(prefix: str) -> CardOptionInput:
     )
 
 
+def _run_controls(catalog) -> str | None:
+    st.subheader("Run Control")
+    active = catalog.get_active_run()
+    if active:
+        st.success(f"Active run: `{active.run_id}` ({active.character.value})")
+    else:
+        st.info("No active run")
+
+    c1, c2, c3, c4 = st.columns(4)
+    if c1.button("New Run"):
+        if active:
+            st.warning(
+                "Esiste gia una run attiva. Completa o abbandona prima di crearne una nuova."
+            )
+        else:
+            new_id = str(uuid.uuid4())
+            catalog.create_run(new_id, Character.IRONCLAD)
+            st.session_state.run_id = new_id
+            st.success("Nuova run creata")
+            st.rerun()
+
+    if c2.button("Resume Active Run"):
+        if active:
+            st.session_state.run_id = active.run_id
+            st.success("Run attiva ripresa")
+            st.rerun()
+        else:
+            st.info("Nessuna run attiva da riprendere")
+
+    abandon_reason = c3.text_input("Abandon reason", value="", key="abandon_reason")
+    if c3.button("Abandon Run"):
+        if active:
+            catalog.abandon_run(active.run_id, abandon_reason)
+            st.session_state.pop("run_id", None)
+            st.warning("Run abbandonata")
+            st.rerun()
+        else:
+            st.info("Nessuna run attiva")
+
+    if c4.button("Complete Run"):
+        if active:
+            catalog.complete_run(active.run_id)
+            st.session_state.pop("run_id", None)
+            st.success("Run completata")
+            st.rerun()
+        else:
+            st.info("Nessuna run attiva")
+
+    current = catalog.get_active_run()
+    return current.run_id if current else None
+
+
+def _decision_feedback_ui(catalog, key_prefix: str) -> None:
+    decision_id = st.session_state.get(f"{key_prefix}_decision_id")
+    recommended = st.session_state.get(f"{key_prefix}_recommended")
+    if not decision_id or not recommended:
+        return
+
+    st.markdown("### Feedback")
+    accepted = st.button("Accepted", key=f"{key_prefix}_accepted")
+    rejected = st.button("Not accepted", key=f"{key_prefix}_rejected")
+    if accepted:
+        catalog.update_decision_feedback(decision_id, recommended, True)
+        st.success("Feedback salvato: accepted")
+    if rejected:
+        chosen = st.text_input(
+            "Chosen option", value="", key=f"{key_prefix}_chosen_text"
+        )
+        if chosen:
+            catalog.update_decision_feedback(decision_id, chosen, False)
+            st.success("Feedback salvato: not accepted")
+
+
 def main() -> None:
     st.set_page_config(page_title="SpireMind STS2", page_icon="S", layout="wide")
     st.title("SpireMind MVP - Slay the Spire 2")
@@ -69,8 +159,11 @@ def main() -> None:
 
     catalog = bootstrap("spiremind.db")
 
-    run_state = _build_run_state()
+    active_run_id = _run_controls(catalog)
+    if not active_run_id:
+        st.stop()
 
+    run_state = _build_run_state(active_run_id)
     card_engine = CardPickerEngine(catalog)
     path_engine = PathPlannerEngine()
     event_engine = EventAdvisorEngine(catalog)
@@ -82,6 +175,7 @@ def main() -> None:
             "Event Advisor",
             "Knowledge Review",
             "KPI Dashboard",
+            "Analytics",
         ]
     )
 
@@ -96,7 +190,33 @@ def main() -> None:
             started_at = catalog.measure_latency()
             result = card_engine.recommend(run_state, [c1, c2, c3, skip])
             latency_ms = catalog.elapsed_ms(started_at)
-            catalog.log_metric("card", result.overall_confidence.value, latency_ms)
+            catalog.log_metric(
+                "card",
+                result.overall_confidence.value,
+                latency_ms,
+                run_id=active_run_id,
+            )
+            catalog.save_snapshot(
+                active_run_id,
+                run_state,
+                {
+                    "type": "card",
+                    "options": [c1.name, c2.name, c3.name, "Skip"],
+                    "top_choice": result.top_choice.name,
+                },
+            )
+            decision_id = catalog.save_decision(
+                active_run_id,
+                "card",
+                result.top_choice.name,
+                {
+                    "confidence": result.overall_confidence.value,
+                    "latency_ms": latency_ms,
+                },
+            )
+            st.session_state["card_decision_id"] = decision_id
+            st.session_state["card_recommended"] = result.top_choice.name
+
             st.success(
                 f"Top choice: {result.top_choice.name} ({result.top_choice.score_total})"
             )
@@ -113,6 +233,8 @@ def main() -> None:
                 )
                 for reason in item.reasons:
                     st.write(f"  - {reason}")
+
+        _decision_feedback_ui(catalog, "card")
 
     with tabs[1]:
         st.subheader("Path candidates")
@@ -150,7 +272,30 @@ def main() -> None:
             started_at = catalog.measure_latency()
             ranked = path_engine.recommend(run_state, [p1, p2])
             latency_ms = catalog.elapsed_ms(started_at)
-            catalog.log_metric("path", ranked[0].confidence.value, latency_ms)
+            catalog.log_metric(
+                "path", ranked[0].confidence.value, latency_ms, run_id=active_run_id
+            )
+            catalog.save_snapshot(
+                active_run_id,
+                run_state,
+                {
+                    "type": "path",
+                    "options": [p1.id, p2.id],
+                    "top_choice": ranked[0].id,
+                },
+            )
+            decision_id = catalog.save_decision(
+                active_run_id,
+                "path",
+                ranked[0].id,
+                {
+                    "confidence": ranked[0].confidence.value,
+                    "latency_ms": latency_ms,
+                },
+            )
+            st.session_state["path_decision_id"] = decision_id
+            st.session_state["path_recommended"] = ranked[0].id
+
             st.success(f"Top path: {ranked[0].id} ({ranked[0].score_total})")
             st.write(f"Latency: {latency_ms} ms")
             if ranked[0].confidence.value == "LOW":
@@ -164,6 +309,8 @@ def main() -> None:
                 for reason in path.reasons:
                     st.write(f"  - {reason}")
 
+        _decision_feedback_ui(catalog, "path")
+
     with tabs[2]:
         st.subheader("Event options")
         event_name = st.text_input("Event name", value="Strange Device")
@@ -176,7 +323,31 @@ def main() -> None:
             started_at = catalog.measure_latency()
             event_result = event_engine.recommend(run_state, event_name, options)
             latency_ms = catalog.elapsed_ms(started_at)
-            catalog.log_metric("event", event_result.confidence.value, latency_ms)
+            catalog.log_metric(
+                "event", event_result.confidence.value, latency_ms, run_id=active_run_id
+            )
+            catalog.save_snapshot(
+                active_run_id,
+                run_state,
+                {
+                    "type": "event",
+                    "event_name": event_name,
+                    "options": options,
+                    "top_choice": event_result.recommended_option,
+                },
+            )
+            decision_id = catalog.save_decision(
+                active_run_id,
+                "event",
+                event_result.recommended_option,
+                {
+                    "confidence": event_result.confidence.value,
+                    "latency_ms": latency_ms,
+                },
+            )
+            st.session_state["event_decision_id"] = decision_id
+            st.session_state["event_recommended"] = event_result.recommended_option
+
             st.success(f"Recommended: {event_result.recommended_option}")
             st.write(f"Confidence: {event_result.confidence.value}")
             st.write(f"Risk: {event_result.risk_level.value}")
@@ -189,10 +360,11 @@ def main() -> None:
             for reason in event_result.reasons:
                 st.write(f"- {reason}")
 
+        _decision_feedback_ui(catalog, "event")
+
     with tabs[3]:
         st.subheader("Discovered entities")
         st.caption("Review rapido di carte/eventi scoperti per aumentare affidabilita")
-
         discovered_cards = catalog.list_discovered_cards()
         discovered_events = catalog.list_discovered_events()
 
@@ -200,14 +372,14 @@ def main() -> None:
         only_frequent_cards = st.checkbox(
             "Show cards seen at least 2 times", value=False
         )
-        if not discovered_cards:
-            st.write("Nessuna carta scoperta da revisionare.")
         filtered_cards = [
             c
             for c in discovered_cards
             if (not only_frequent_cards or c.times_seen >= 2)
         ]
-        if discovered_cards and not filtered_cards:
+        if not discovered_cards:
+            st.write("Nessuna carta scoperta da revisionare.")
+        elif not filtered_cards:
             st.write("Nessuna carta corrisponde al filtro corrente.")
         for card in filtered_cards:
             with st.expander(f"{card.name} [{card.status}]"):
@@ -231,14 +403,14 @@ def main() -> None:
         only_frequent_events = st.checkbox(
             "Show events seen at least 2 times", value=False
         )
-        if not discovered_events:
-            st.write("Nessun evento scoperto da revisionare.")
         filtered_events = [
             e
             for e in discovered_events
             if (not only_frequent_events or e.times_seen >= 2)
         ]
-        if discovered_events and not filtered_events:
+        if not discovered_events:
+            st.write("Nessun evento scoperto da revisionare.")
+        elif not filtered_events:
             st.write("Nessun evento corrisponde al filtro corrente.")
         for event in filtered_events:
             with st.expander(f"{event.name} [{event.status}]"):
@@ -255,12 +427,86 @@ def main() -> None:
 
     with tabs[4]:
         st.subheader("KPI snapshot")
-        snapshot = catalog.get_kpi_snapshot()
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("p95 latency (ms)", snapshot["p95_latency_ms"])
-        c2.metric("Low confidence %", snapshot["low_confidence_pct"])
-        c3.metric("Reviewed %", snapshot["reviewed_pct"])
-        c4.metric("Recommendation samples", int(snapshot["samples"]))
+        scope_col, lastn_col = st.columns(2)
+        kpi_scope = scope_col.selectbox(
+            "Scope",
+            ["All runs", "Active run only"],
+            index=1,
+        )
+        last_n = int(
+            lastn_col.number_input(
+                "Last N recommendations (0 = all)",
+                min_value=0,
+                max_value=2000,
+                value=100,
+                step=10,
+            )
+        )
+        scope_run_id = active_run_id if kpi_scope == "Active run only" else None
+        scoped_last_n = None if last_n == 0 else last_n
+
+        snapshot = catalog.get_kpi_snapshot(run_id=scope_run_id, last_n=scoped_last_n)
+        acceptance = catalog.get_acceptance_stats(
+            run_id=scope_run_id,
+            last_n=scoped_last_n,
+        )
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("p95 latency (ms)", snapshot["p95_latency_ms"])
+        k2.metric("Low confidence %", snapshot["low_confidence_pct"])
+        k3.metric("Reviewed %", snapshot["reviewed_pct"])
+        k4.metric("Recommendation samples", int(snapshot["samples"]))
+
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Overall acceptance %", acceptance["overall_acceptance_pct"])
+        a2.metric("Card acceptance %", acceptance["card_acceptance_pct"])
+        a3.metric("Path acceptance %", acceptance["path_acceptance_pct"])
+        a4.metric("Event acceptance %", acceptance["event_acceptance_pct"])
+        st.write(f"Feedback samples: {int(acceptance['feedback_samples'])}")
+
+        st.markdown("### Recent decisions (active run)")
+        recent = catalog.list_recent_decisions(active_run_id, limit=8)
+        if not recent:
+            st.write("Nessuna decisione salvata per la run attiva.")
+        else:
+            for item in recent:
+                accepted_label = (
+                    "pending"
+                    if item.accepted is None
+                    else "accepted"
+                    if item.accepted
+                    else "not accepted"
+                )
+                chosen = item.chosen or "-"
+                st.write(
+                    f"- [{item.decision_type}] rec: {item.recommended} | chosen: {chosen} | {accepted_label}"
+                )
+
+        st.markdown("### Export CSV")
+        export_limit = int(
+            st.number_input(
+                "Export last N rows (0 = all)",
+                min_value=0,
+                max_value=5000,
+                value=200,
+                step=50,
+            )
+        )
+        export_n = None if export_limit == 0 else export_limit
+        decisions_csv = catalog.export_decisions_csv(active_run_id, limit=export_n)
+        snapshots_csv = catalog.export_snapshots_csv(active_run_id, limit=export_n)
+        st.download_button(
+            "Download decisions CSV",
+            data=decisions_csv,
+            file_name=f"spiremind_decisions_{active_run_id}.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "Download snapshots CSV",
+            data=snapshots_csv,
+            file_name=f"spiremind_snapshots_{active_run_id}.csv",
+            mime="text/csv",
+        )
 
         st.markdown("### Target MVP")
         st.write("- p95 latency < 300 ms")
@@ -275,6 +521,47 @@ def main() -> None:
             st.warning("p95 latency sopra target MVP (300 ms).")
         else:
             st.success("p95 latency entro target MVP.")
+
+    with tabs[5]:
+        st.subheader("Analytics")
+        trend_days = int(
+            st.number_input(
+                "Trend days",
+                min_value=1,
+                max_value=90,
+                value=14,
+                step=1,
+            )
+        )
+        daily = catalog.get_daily_trends(days_limit=trend_days)
+        st.markdown("### Daily trends")
+        if not daily:
+            st.write("Nessun dato trend disponibile.")
+        else:
+            for row in daily:
+                st.write(
+                    f"- {row.day} | recs: {row.recommendation_count} | avg latency: {row.avg_latency_ms} ms | low confidence: {row.low_confidence_pct}%"
+                )
+
+        run_limit = int(
+            st.number_input(
+                "Recent run summaries",
+                min_value=1,
+                max_value=50,
+                value=10,
+                step=1,
+            )
+        )
+        summaries = catalog.get_recent_run_summaries(limit=run_limit)
+        st.markdown("### Runs")
+        if not summaries:
+            st.write("Nessuna run trovata.")
+        else:
+            for run in summaries:
+                ended = run.ended_at or "-"
+                st.write(
+                    f"- {run.run_id} | {run.status} | decisions: {run.decision_count} | acceptance: {run.acceptance_pct}% | start: {run.created_at} | end: {ended}"
+                )
 
 
 if __name__ == "__main__":

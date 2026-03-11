@@ -3,12 +3,23 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from csv import DictWriter
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
+from typing import Any
 
-from spiremind.domain.models import CardOptionInput, CardType, GameId, normalize_name
+from spiremind.domain.models import (
+    CardOptionInput,
+    CardType,
+    Character,
+    GameId,
+    RunState,
+    RunStatus,
+    normalize_name,
+)
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 
 @dataclass(slots=True)
@@ -39,6 +50,46 @@ class CatalogEvent:
     confidence_catalog: str
     source: str
     times_seen: int = 0
+
+
+@dataclass(slots=True)
+class RunRecord:
+    run_id: str
+    game_id: GameId
+    character: Character
+    status: RunStatus
+    created_at: str
+    ended_at: str | None
+    end_reason: str | None
+
+
+@dataclass(slots=True)
+class DecisionRecord:
+    id: int
+    run_id: str
+    decision_type: str
+    recommended: str
+    chosen: str | None
+    accepted: bool | None
+    created_at: str
+
+
+@dataclass(slots=True)
+class DailyTrendRecord:
+    day: str
+    recommendation_count: int
+    avg_latency_ms: float
+    low_confidence_pct: float
+
+
+@dataclass(slots=True)
+class RunSummaryRecord:
+    run_id: str
+    status: str
+    created_at: str
+    ended_at: str | None
+    decision_count: int
+    acceptance_pct: float
 
 
 class CatalogStore:
@@ -125,10 +176,54 @@ class CatalogStore:
                 CREATE TABLE IF NOT EXISTS metrics_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     game_id TEXT NOT NULL DEFAULT 'STS2',
+                    run_id TEXT,
                     metric_type TEXT NOT NULL,
                     confidence TEXT,
                     latency_ms REAL NOT NULL,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runs (
+                    run_id TEXT PRIMARY KEY,
+                    game_id TEXT NOT NULL DEFAULT 'STS2',
+                    character TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    ended_at TEXT,
+                    end_reason TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    floor INTEGER NOT NULL,
+                    act INTEGER NOT NULL,
+                    hp INTEGER NOT NULL,
+                    gold INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    decision_type TEXT NOT NULL,
+                    recommended TEXT NOT NULL,
+                    chosen TEXT,
+                    accepted INTEGER,
+                    context_json TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
                 )
                 """
             )
@@ -163,6 +258,7 @@ class CatalogStore:
         self._ensure_column_exists(
             "discovery_log", "game_id", "TEXT NOT NULL DEFAULT 'STS2'"
         )
+        self._ensure_column_exists("metrics_log", "run_id", "TEXT")
 
     def _ensure_column_exists(
         self, table_name: str, column_name: str, column_def: str
@@ -194,14 +290,20 @@ class CatalogStore:
             return None
         return str(row["value"])
 
-    def log_metric(self, metric_type: str, confidence: str, latency_ms: float) -> None:
+    def log_metric(
+        self,
+        metric_type: str,
+        confidence: str,
+        latency_ms: float,
+        run_id: str | None = None,
+    ) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO metrics_log(game_id, metric_type, confidence, latency_ms)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO metrics_log(game_id, run_id, metric_type, confidence, latency_ms)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (GameId.STS2.value, metric_type, confidence, float(latency_ms)),
+                (GameId.STS2.value, run_id, metric_type, confidence, float(latency_ms)),
             )
 
     def measure_latency(self) -> float:
@@ -210,27 +312,22 @@ class CatalogStore:
     def elapsed_ms(self, started_at: float) -> float:
         return round((time.perf_counter() - started_at) * 1000.0, 2)
 
-    def get_kpi_snapshot(self) -> dict[str, float]:
+    def get_kpi_snapshot(
+        self,
+        run_id: str | None = None,
+        last_n: int | None = None,
+    ) -> dict[str, float]:
         with self.connect() as conn:
-            p95_row = conn.execute(
-                """
-                SELECT latency_ms FROM metrics_log
-                WHERE game_id = ?
-                ORDER BY latency_ms ASC
-                """,
-                (GameId.STS2.value,),
-            ).fetchall()
-            total_row = conn.execute(
-                "SELECT COUNT(*) AS count FROM metrics_log WHERE game_id = ?",
-                (GameId.STS2.value,),
-            ).fetchone()
-            low_row = conn.execute(
-                """
-                SELECT COUNT(*) AS count FROM metrics_log
-                WHERE game_id = ? AND confidence = 'LOW'
-                """,
-                (GameId.STS2.value,),
-            ).fetchone()
+            metric_params: list[Any] = [GameId.STS2.value]
+            metric_where = ["game_id = ?"]
+            if run_id:
+                metric_where.append("run_id = ?")
+                metric_params.append(run_id)
+            metric_scope = f"SELECT latency_ms, confidence FROM metrics_log WHERE {' AND '.join(metric_where)} ORDER BY id DESC"
+            if last_n is not None and last_n > 0:
+                metric_scope += " LIMIT ?"
+                metric_params.append(last_n)
+            metric_rows = conn.execute(metric_scope, tuple(metric_params)).fetchall()
             reviewed_row = conn.execute(
                 """
                 SELECT COUNT(*) AS reviewed FROM (
@@ -252,15 +349,16 @@ class CatalogStore:
                 (GameId.STS2.value, GameId.STS2.value),
             ).fetchone()
 
-        total = int(total_row["count"]) if total_row else 0
-        low = int(low_row["count"]) if low_row else 0
+        total = len(metric_rows)
+        low = sum(1 for row in metric_rows if row["confidence"] == "LOW")
         discovered = int(discovered_row["discovered"]) if discovered_row else 0
         reviewed = int(reviewed_row["reviewed"]) if reviewed_row else 0
 
         p95 = 0.0
-        if p95_row:
-            idx = max(0, int(len(p95_row) * 0.95) - 1)
-            p95 = float(p95_row[idx]["latency_ms"])
+        if metric_rows:
+            sorted_rows = sorted(metric_rows, key=lambda row: float(row["latency_ms"]))
+            idx = max(0, int(len(sorted_rows) * 0.95) - 1)
+            p95 = float(sorted_rows[idx]["latency_ms"])
 
         low_pct = (low / total * 100.0) if total else 0.0
         reviewed_pct = (reviewed / discovered * 100.0) if discovered else 0.0
@@ -270,6 +368,406 @@ class CatalogStore:
             "reviewed_pct": round(reviewed_pct, 2),
             "samples": float(total),
         }
+
+    def get_acceptance_stats(
+        self,
+        run_id: str | None = None,
+        last_n: int | None = None,
+    ) -> dict[str, float]:
+        with self.connect() as conn:
+            params: list[Any] = [GameId.STS2.value]
+            where = ["r.game_id = ?"]
+            if run_id:
+                where.append("d.run_id = ?")
+                params.append(run_id)
+            scope = f"SELECT d.* FROM decisions d JOIN runs r ON r.run_id = d.run_id WHERE {' AND '.join(where)} ORDER BY d.id DESC"
+            if last_n is not None and last_n > 0:
+                scope += " LIMIT ?"
+                params.append(last_n)
+            scoped_rows = conn.execute(scope, tuple(params)).fetchall()
+
+        stats: dict[str, float] = {
+            "overall_acceptance_pct": 0.0,
+            "card_acceptance_pct": 0.0,
+            "path_acceptance_pct": 0.0,
+            "event_acceptance_pct": 0.0,
+            "feedback_samples": 0.0,
+        }
+        total_accepted = 0
+        total_feedback = 0
+        counters: dict[str, dict[str, int]] = {
+            "card": {"accepted": 0, "feedback": 0},
+            "path": {"accepted": 0, "feedback": 0},
+            "event": {"accepted": 0, "feedback": 0},
+        }
+        for row in scoped_rows:
+            decision_type = str(row["decision_type"])
+            if decision_type not in counters:
+                continue
+            accepted_raw = row["accepted"]
+            if accepted_raw is None:
+                continue
+            counters[decision_type]["feedback"] += 1
+            if int(accepted_raw) == 1:
+                counters[decision_type]["accepted"] += 1
+
+        for decision_type, counts in counters.items():
+            total_feedback += counts["feedback"]
+            total_accepted += counts["accepted"]
+            pct = (
+                counts["accepted"] / counts["feedback"] * 100.0
+                if counts["feedback"]
+                else 0.0
+            )
+            stats[f"{decision_type}_acceptance_pct"] = round(pct, 2)
+
+        stats["overall_acceptance_pct"] = (
+            round(total_accepted / total_feedback * 100.0, 2) if total_feedback else 0.0
+        )
+        stats["feedback_samples"] = float(total_feedback)
+        return stats
+
+    def list_recent_decisions(
+        self, run_id: str, limit: int = 10
+    ) -> list[DecisionRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, run_id, decision_type, recommended, chosen, accepted, created_at
+                FROM decisions
+                WHERE run_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (run_id, max(1, limit)),
+            ).fetchall()
+        results: list[DecisionRecord] = []
+        for row in rows:
+            accepted_raw = row["accepted"]
+            accepted = None if accepted_raw is None else bool(accepted_raw)
+            results.append(
+                DecisionRecord(
+                    id=int(row["id"]),
+                    run_id=str(row["run_id"]),
+                    decision_type=str(row["decision_type"]),
+                    recommended=str(row["recommended"]),
+                    chosen=row["chosen"],
+                    accepted=accepted,
+                    created_at=str(row["created_at"]),
+                )
+            )
+        return results
+
+    def export_decisions_csv(self, run_id: str, limit: int | None = None) -> str:
+        with self.connect() as conn:
+            query = """
+                SELECT id, run_id, decision_type, recommended, chosen, accepted, created_at
+                FROM decisions
+                WHERE run_id = ?
+                ORDER BY id DESC
+            """
+            params: list[Any] = [run_id]
+            if limit is not None and limit > 0:
+                query += " LIMIT ?"
+                params.append(limit)
+            rows = conn.execute(query, tuple(params)).fetchall()
+
+        buf = StringIO()
+        writer = DictWriter(
+            buf,
+            fieldnames=[
+                "id",
+                "run_id",
+                "decision_type",
+                "recommended",
+                "chosen",
+                "accepted",
+                "created_at",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "id": row["id"],
+                    "run_id": row["run_id"],
+                    "decision_type": row["decision_type"],
+                    "recommended": row["recommended"],
+                    "chosen": row["chosen"] or "",
+                    "accepted": "" if row["accepted"] is None else int(row["accepted"]),
+                    "created_at": row["created_at"],
+                }
+            )
+        return buf.getvalue()
+
+    def export_snapshots_csv(self, run_id: str, limit: int | None = None) -> str:
+        with self.connect() as conn:
+            query = """
+                SELECT id, run_id, floor, act, hp, gold, payload_json, created_at
+                FROM run_snapshots
+                WHERE run_id = ?
+                ORDER BY id DESC
+            """
+            params: list[Any] = [run_id]
+            if limit is not None and limit > 0:
+                query += " LIMIT ?"
+                params.append(limit)
+            rows = conn.execute(query, tuple(params)).fetchall()
+
+        buf = StringIO()
+        writer = DictWriter(
+            buf,
+            fieldnames=[
+                "id",
+                "run_id",
+                "floor",
+                "act",
+                "hp",
+                "gold",
+                "payload_json",
+                "created_at",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "id": row["id"],
+                    "run_id": row["run_id"],
+                    "floor": row["floor"],
+                    "act": row["act"],
+                    "hp": row["hp"],
+                    "gold": row["gold"],
+                    "payload_json": row["payload_json"],
+                    "created_at": row["created_at"],
+                }
+            )
+        return buf.getvalue()
+
+    def get_daily_trends(self, days_limit: int = 14) -> list[DailyTrendRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DATE(created_at) AS day,
+                       COUNT(*) AS recommendation_count,
+                       AVG(latency_ms) AS avg_latency_ms,
+                       SUM(CASE WHEN confidence = 'LOW' THEN 1 ELSE 0 END) AS low_count
+                FROM metrics_log
+                WHERE game_id = ?
+                GROUP BY DATE(created_at)
+                ORDER BY day DESC
+                LIMIT ?
+                """,
+                (GameId.STS2.value, max(1, days_limit)),
+            ).fetchall()
+        results: list[DailyTrendRecord] = []
+        for row in rows:
+            recommendation_count = int(row["recommendation_count"] or 0)
+            low_count = int(row["low_count"] or 0)
+            low_pct = (
+                round(low_count / recommendation_count * 100.0, 2)
+                if recommendation_count
+                else 0.0
+            )
+            results.append(
+                DailyTrendRecord(
+                    day=str(row["day"]),
+                    recommendation_count=recommendation_count,
+                    avg_latency_ms=round(float(row["avg_latency_ms"] or 0.0), 2),
+                    low_confidence_pct=low_pct,
+                )
+            )
+        return results
+
+    def get_recent_run_summaries(self, limit: int = 10) -> list[RunSummaryRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT r.run_id,
+                       r.status,
+                       r.created_at,
+                       r.ended_at,
+                       COUNT(d.id) AS decision_count,
+                       SUM(CASE WHEN d.accepted = 1 THEN 1 ELSE 0 END) AS accepted_count,
+                       SUM(CASE WHEN d.accepted IS NOT NULL THEN 1 ELSE 0 END) AS feedback_count
+                FROM runs r
+                LEFT JOIN decisions d ON d.run_id = r.run_id
+                WHERE r.game_id = ?
+                GROUP BY r.run_id, r.status, r.created_at, r.ended_at
+                ORDER BY r.created_at DESC
+                LIMIT ?
+                """,
+                (GameId.STS2.value, max(1, limit)),
+            ).fetchall()
+        results: list[RunSummaryRecord] = []
+        for row in rows:
+            feedback_count = int(row["feedback_count"] or 0)
+            accepted_count = int(row["accepted_count"] or 0)
+            acceptance_pct = (
+                round(accepted_count / feedback_count * 100.0, 2)
+                if feedback_count
+                else 0.0
+            )
+            results.append(
+                RunSummaryRecord(
+                    run_id=str(row["run_id"]),
+                    status=str(row["status"]),
+                    created_at=str(row["created_at"]),
+                    ended_at=row["ended_at"],
+                    decision_count=int(row["decision_count"] or 0),
+                    acceptance_pct=acceptance_pct,
+                )
+            )
+        return results
+
+    def get_active_run(self) -> RunRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE game_id = ? AND status = 'ACTIVE'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (GameId.STS2.value,),
+            ).fetchone()
+        if not row:
+            return None
+        return RunRecord(
+            run_id=row["run_id"],
+            game_id=GameId(row["game_id"]),
+            character=Character(row["character"]),
+            status=RunStatus(row["status"]),
+            created_at=row["created_at"],
+            ended_at=row["ended_at"],
+            end_reason=row["end_reason"],
+        )
+
+    def create_run(self, run_id: str, character: Character) -> RunRecord:
+        active = self.get_active_run()
+        if active:
+            raise ValueError("An active run already exists")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO runs(run_id, game_id, character, status)
+                VALUES (?, ?, ?, ?)
+                """,
+                (run_id, GameId.STS2.value, character.value, RunStatus.ACTIVE.value),
+            )
+            row = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if not row:
+            raise RuntimeError("Failed to create run")
+        return RunRecord(
+            run_id=row["run_id"],
+            game_id=GameId(row["game_id"]),
+            character=Character(row["character"]),
+            status=RunStatus(row["status"]),
+            created_at=row["created_at"],
+            ended_at=row["ended_at"],
+            end_reason=row["end_reason"],
+        )
+
+    def abandon_run(self, run_id: str, reason: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET status = ?, ended_at = CURRENT_TIMESTAMP, end_reason = ?
+                WHERE run_id = ? AND status = ?
+                """,
+                (
+                    RunStatus.ABANDONED.value,
+                    reason.strip() or "user_abandoned",
+                    run_id,
+                    RunStatus.ACTIVE.value,
+                ),
+            )
+
+    def complete_run(self, run_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET status = ?, ended_at = CURRENT_TIMESTAMP, end_reason = ?
+                WHERE run_id = ? AND status = ?
+                """,
+                (
+                    RunStatus.COMPLETED.value,
+                    "run_completed",
+                    run_id,
+                    RunStatus.ACTIVE.value,
+                ),
+            )
+
+    def save_snapshot(
+        self,
+        run_id: str,
+        run_state: RunState,
+        payload: dict[str, Any],
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO run_snapshots(run_id, floor, act, hp, gold, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    run_state.floor,
+                    run_state.act,
+                    run_state.current_hp,
+                    run_state.gold,
+                    json.dumps(payload),
+                ),
+            )
+
+    def save_decision(
+        self,
+        run_id: str,
+        decision_type: str,
+        recommended: str,
+        context: dict[str, Any],
+        chosen: str | None = None,
+        accepted: bool | None = None,
+    ) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO decisions(run_id, decision_type, recommended, chosen, accepted, context_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    decision_type,
+                    recommended,
+                    chosen,
+                    None if accepted is None else int(accepted),
+                    json.dumps(context),
+                ),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("Failed to save decision")
+            return int(cursor.lastrowid)
+
+    def update_decision_feedback(
+        self,
+        decision_id: int,
+        chosen: str,
+        accepted: bool,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE decisions
+                SET chosen = ?, accepted = ?
+                WHERE id = ?
+                """,
+                (chosen, int(accepted), decision_id),
+            )
 
     def seed_initial_cards(self) -> None:
         seed_cards = [
