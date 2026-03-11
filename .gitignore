@@ -10,3 +10,6 @@ venv/
 
 # Local runtime data
 spiremind.db
+
+# IDE
+.vscode/
