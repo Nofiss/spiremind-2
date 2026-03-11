@@ -1,0 +1,10 @@
+[project]
+name = "spiremind"
+version = "0.1.0"
+description = "Slay the Spire decision assistant MVP"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

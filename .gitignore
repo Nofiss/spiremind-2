@@ -1,0 +1,12 @@
+# Python cache and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local runtime data
+spiremind.db
